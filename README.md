@@ -5,6 +5,12 @@ A curses-based terminal dashboard for real-time ROS2 robot diagnostics. Monitor 
 ![ROS2](https://img.shields.io/badge/ROS2-Humble%20%7C%20Jazzy-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
+![Main dashboard showing topic rates, TF frames, lifecycle nodes, and TF tree](media/dashboard.webp)
+
+## Demo
+
+https://github.com/DingoOz/ros2_diag_tui/raw/main/media/demo.mp4
+
 ## Features
 
 - **Topic monitoring** — live publish rates, bandwidth, and staleness detection for any ROS2 topic
@@ -12,6 +18,8 @@ A curses-based terminal dashboard for real-time ROS2 robot diagnostics. Monitor 
 - **Nav2 lifecycle** — monitor lifecycle node states (unconfigured, inactive, active, finalized)
 - **LiDAR overlay** — braille-rendered polar scan view with zoom and rotation
 - **Map overlay** — braille-rendered occupancy grid with pan, zoom, and robot tracking
+
+![LiDAR braille scan overlay with range rings](media/lidar-view.webp)
 - **Network diagnostics** — interface status, IP addresses, and ARP neighbor discovery
 - **Event log** — timestamped history of state transitions and alerts
 - **Message preview** — inspect latest message fields for any monitored topic
