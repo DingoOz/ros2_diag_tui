@@ -1,0 +1,96 @@
+# ros2_diag_tui Configuration — TurtleBot4 (Standard / Lite)
+# iRobot Create3 base + RPLiDAR A1M8 + OAK-D camera.
+# Global settings for timing, rate calculation, and UI refresh
+settings:
+  stale_data_timeout: 2.0
+  tf_check_interval: 1.0
+  lifecycle_check_interval: 2.0
+  rate_window_size: 10
+  rate_warning_threshold: 0.8
+  rate_critical_threshold: 0.5
+  refresh_ms: 200
+  refresh_min_ms: 100
+  refresh_max_ms: 2000
+  refresh_step_ms: 100
+# Topics to monitor for rate and connectivity
+monitored_topics:
+  - name: scan
+    topic: /scan
+    type: LaserScan
+    expected_hz: 10.0
+    critical: true
+  - name: imu
+    topic: /imu
+    type: Imu
+    expected_hz: 20.0
+    critical: true
+  - name: odom
+    topic: /odom
+    type: Odometry
+    expected_hz: 20.0
+    critical: true
+  - name: map
+    topic: /map
+    type: OccupancyGrid
+    expected_hz: 0.1
+    critical: false
+  - name: cmd_vel
+    topic: /cmd_vel
+    type: Twist
+    expected_hz: 0.0
+    critical: false
+  - name: joint_states
+    topic: /joint_states
+    type: JointState
+    expected_hz: 10.0
+    critical: false
+  - name: oakd_rgb
+    topic: /oakd/rgb/preview/image_raw
+    type: Image
+    expected_hz: 15.0
+    critical: false
+# Joystick device monitoring
+joystick:
+  device_path: "/dev/input/js*"
+# TF frame chains to verify connectivity
+tf_frames:
+  - parent: map
+    child: odom
+    description: AMCL
+    critical: true
+  - parent: odom
+    child: base_footprint
+    description: Create3
+    critical: true
+  - parent: base_footprint
+    child: base_link
+    description: URDF
+    critical: true
+  - parent: base_link
+    child: rplidar_link
+    description: RPLiDAR
+    critical: true
+  - parent: rplidar_link
+    child: laser_frame
+    description: Laser
+    critical: true
+  - parent: base_link
+    child: imu_link
+    description: IMU
+    critical: true
+  - parent: base_link
+    child: oakd_link
+    description: OAK-D
+    critical: false
+# Nav2 lifecycle nodes to monitor state
+lifecycle_nodes:
+  - bt_navigator
+  - controller_server
+  - planner_server
+  - map_server
+  - amcl
+  - smoother_server
+  - velocity_smoother
+  - collision_monitor
+  - waypoint_follower
+  - behavior_server
