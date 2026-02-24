@@ -607,10 +607,41 @@ class DiagTUINode(Node):
                     image_qos,
                 )
 
+    @staticmethod
+    def _estimate_msg_size(msg) -> int:
+        """Estimate serialized message size from message fields.
+
+        Uses knowledge of ROS2 CDR serialization sizes rather than Python
+        object overhead (which sys.getsizeof returns).
+        """
+        msg_type = type(msg).__name__
+        if msg_type == "LaserScan":
+            return 52 + len(msg.ranges) * 4 + len(msg.intensities) * 4
+        elif msg_type == "Imu":
+            # header + orientation(4*8) + angular_vel(3*8) + linear_accel(3*8)
+            # + 3 covariance matrices(9*8 each)
+            return 32 + 32 + 24 + 24 + 216
+        elif msg_type == "Odometry":
+            # header + child_frame_id + pose(7*8 + 36*8) + twist(6*8 + 36*8)
+            return 32 + 32 + 56 + 288 + 48 + 288
+        elif msg_type == "OccupancyGrid":
+            return 60 + len(msg.data)
+        elif msg_type == "Twist":
+            return 48
+        elif msg_type == "Joy":
+            return 32 + len(msg.axes) * 4 + len(msg.buttons) * 4
+        elif msg_type == "JointState":
+            n = max(len(msg.position), len(msg.velocity), len(msg.effort))
+            name_bytes = sum(len(s) + 4 for s in msg.name) if msg.name else 0
+            return 32 + name_bytes + n * 24
+        elif msg_type == "Image":
+            return 52 + len(msg.data)
+        return 256  # Reasonable default for unknown types
+
     def _topic_callback(self, topic_name: str, msg=None):
         """Generic callback for topic monitoring. Optionally stores message summary."""
         now = time.time()
-        msg_size = sys.getsizeof(msg) if msg is not None else 0
+        msg_size = self._estimate_msg_size(msg) if msg is not None else 0
         with self._status_lock:
             status = self.topic_statuses[topic_name]
             status.last_msg_time = now
@@ -623,7 +654,7 @@ class DiagTUINode(Node):
 
     def _joy_callback(self, msg, topic_name: str):
         """Callback for Joy topic - records rate and captures axes/buttons."""
-        self._topic_callback(topic_name)
+        self._topic_callback(topic_name, msg)
         with self._status_lock:
             self.joystick_status.num_axes = len(msg.axes)
             self.joystick_status.num_buttons = len(msg.buttons)
@@ -675,7 +706,7 @@ class DiagTUINode(Node):
 
     def _cmd_vel_callback(self, msg, topic_name: str):
         """Callback for Twist (cmd_vel) topic - records rate and captures velocities."""
-        self._topic_callback(topic_name)
+        self._topic_callback(topic_name, msg)
         with self._status_lock:
             self.cmd_vel_status.linear_x = msg.linear.x
             self.cmd_vel_status.linear_y = msg.linear.y
@@ -696,7 +727,7 @@ class DiagTUINode(Node):
         Scan data (ranges array) is only copied when the LiDAR view is active,
         reducing bandwidth and memory overhead during normal dashboard use.
         """
-        self._topic_callback(topic_name)
+        self._topic_callback(topic_name, msg)
         with self._status_lock:
             self.last_messages[topic_name] = {
                 "angle_min": f"{msg.angle_min:.4f}",
@@ -873,47 +904,61 @@ class DiagTUINode(Node):
         node_names = [name for name, ns in self.get_node_names_and_namespaces()]
         rsp_running = "robot_state_publisher" in node_names
 
+        # Read TF pairs under lock (fast), then do lookups outside the lock
+        # to avoid blocking the draw loop during potentially slow lookups.
         with self._status_lock:
-            for tf_status in self.tf_statuses:
-                try:
-                    transform = self.tf_buffer.lookup_transform(
-                        tf_status.parent,
-                        tf_status.child,
-                        rclpy.time.Time(),
-                        timeout=rclpy.duration.Duration(seconds=0.1),
-                    )
-                    # Check if transform is stale by comparing timestamp age
-                    tf_time_sec = (
-                        transform.header.stamp.sec
-                        + transform.header.stamp.nanosec * 1e-9
-                    )
-                    if tf_time_sec == 0:
-                        # Static transform - check if robot_state_publisher is running
-                        if not rsp_running:
-                            tf_status.connected = False
-                            tf_status.error_msg = "RSP not running"
-                        else:
-                            tf_status.connected = True
-                            tf_status.error_msg = ""
-                    else:
-                        # Dynamic transform - check staleness based on transform timestamp
-                        now_msg = self.get_clock().now().to_msg()
-                        now_sec = now_msg.sec + now_msg.nanosec * 1e-9
-                        age = now_sec - tf_time_sec
+            tf_pairs = [(s.parent, s.child) for s in self.tf_statuses]
 
-                        if age > self.stale_data_timeout:
-                            tf_status.connected = False
-                            tf_status.error_msg = f"stale ({age:.1f}s old)"
-                        else:
-                            tf_status.connected = True
-                            tf_status.error_msg = ""
-                except (
-                    LookupException,
-                    ConnectivityException,
-                    ExtrapolationException,
-                ) as e:
+        results = []
+        for parent, child in tf_pairs:
+            try:
+                transform = self.tf_buffer.lookup_transform(
+                    parent,
+                    child,
+                    rclpy.time.Time(),
+                    timeout=rclpy.duration.Duration(seconds=0.1),
+                )
+                results.append((True, transform, ""))
+            except (
+                LookupException,
+                ConnectivityException,
+                ExtrapolationException,
+            ) as e:
+                results.append((False, None, str(e)[:50]))
+
+        # Write results back under lock
+        with self._status_lock:
+            for tf_status, (connected, transform, error_msg) in zip(
+                self.tf_statuses, results
+            ):
+                if not connected:
                     tf_status.connected = False
-                    tf_status.error_msg = str(e)[:50]
+                    tf_status.error_msg = error_msg
+                    continue
+                tf_time_sec = (
+                    transform.header.stamp.sec
+                    + transform.header.stamp.nanosec * 1e-9
+                )
+                if tf_time_sec == 0:
+                    # Static transform - check if robot_state_publisher is running
+                    if not rsp_running:
+                        tf_status.connected = False
+                        tf_status.error_msg = "RSP not running"
+                    else:
+                        tf_status.connected = True
+                        tf_status.error_msg = ""
+                else:
+                    # Dynamic transform - check staleness based on transform timestamp
+                    now_msg = self.get_clock().now().to_msg()
+                    now_sec = now_msg.sec + now_msg.nanosec * 1e-9
+                    age = now_sec - tf_time_sec
+
+                    if age > self.stale_data_timeout:
+                        tf_status.connected = False
+                        tf_status.error_msg = f"stale ({age:.1f}s old)"
+                    else:
+                        tf_status.connected = True
+                        tf_status.error_msg = ""
 
         # Build the TF tree from the buffer
         self._build_tf_tree()
@@ -1119,6 +1164,8 @@ class DiagTUI:
         self._net_neighbors: List[Dict[str, str]] = []  # Cached neighbor list
         self._net_last_sel = -1  # Track selection changes to refresh neighbors
         self._net_neighbor_scroll = 0  # Scroll offset for neighbor list
+        self._dns_cache: Dict[str, str] = {}  # IP -> hostname cache
+        self._dns_thread: Optional[threading.Thread] = None  # Background DNS resolver
 
         # Event log overlay (Feature 4)
         self.show_event_log = False
@@ -1709,19 +1756,12 @@ class DiagTUI:
                         ):
                             state = parts[-1]
 
-                        # Try reverse DNS (non-blocking with short timeout)
-                        hostname = ""
-                        try:
-                            hostname = socket.gethostbyaddr(ip_addr)[0]
-                        except (socket.herror, socket.gaierror, OSError):
-                            pass
-
                         neighbors.append(
                             {
                                 "ip": ip_addr,
                                 "mac": mac,
                                 "state": state,
-                                "hostname": hostname,
+                                "hostname": "",
                             }
                         )
         except (subprocess.TimeoutExpired, FileNotFoundError):
@@ -1732,6 +1772,34 @@ class DiagTUI:
             key=lambda n: tuple(int(x) for x in n["ip"].split(".") if x.isdigit())
         )
         return neighbors
+
+    def _resolve_neighbors_dns(self):
+        """Apply cached DNS hostnames and kick off background resolution for new IPs."""
+        ips_to_resolve = []
+        for n in self._net_neighbors:
+            cached = self._dns_cache.get(n["ip"])
+            if cached is not None:
+                n["hostname"] = cached
+            else:
+                ips_to_resolve.append(n["ip"])
+
+        if not ips_to_resolve:
+            return
+        if self._dns_thread is not None and self._dns_thread.is_alive():
+            return  # Resolution already in progress
+
+        def resolve(ips):
+            for ip in ips:
+                try:
+                    hostname = socket.gethostbyaddr(ip)[0]
+                    self._dns_cache[ip] = hostname
+                except (socket.herror, socket.gaierror, OSError):
+                    self._dns_cache[ip] = ""
+
+        self._dns_thread = threading.Thread(
+            target=resolve, args=(ips_to_resolve,), daemon=True
+        )
+        self._dns_thread.start()
 
     def draw_network_dialog(self):
         """Draw full-screen network view with selectable interfaces and neighbor list."""
@@ -1767,6 +1835,9 @@ class DiagTUI:
                 self._net_neighbors = self._get_neighbors(sel_iface)
             else:
                 self._net_neighbors = []
+
+        # Resolve hostnames asynchronously (applies cache, starts bg thread for new IPs)
+        self._resolve_neighbors_dns()
 
         # Layout: full-screen overlay
         # Title bar (row 0), interface panel (left), neighbor panel (right),
@@ -2284,6 +2355,7 @@ class DiagTUI:
         grid_cells = [[0] * chart_w for _ in range(chart_h)]
 
         # Draw range rings at nice intervals
+        ring_step = 0.0
         if view_range > 0:
             # Pick ring spacing: 0.5, 1, 2, 5, 10, 20, 50 meters
             ring_options = [0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0]
