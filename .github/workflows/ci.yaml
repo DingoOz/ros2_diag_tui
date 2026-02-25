@@ -6,16 +6,54 @@ on:
   pull_request:
     branches: [main]
 
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    container:
+      image: ros:jazzy-ros-base
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install lint dependencies
+        run: |
+          apt-get update
+          apt-get install -y python3-pip python3-colcon-common-extensions
+          rosdep update
+          rosdep install --from-paths . --ignore-src -r -y
+
+      - name: Run ament lint tests
+        run: |
+          . /opt/ros/jazzy/setup.sh
+          colcon build --packages-select ros2_diag_tui
+          . install/setup.sh
+          colcon test --packages-select ros2_diag_tui --event-handlers console_direct+
+          colcon test-result --verbose
+
   build-and-test:
+    name: Build & Test (ROS ${{ matrix.ros_distro }})
+    needs: lint
     strategy:
+      fail-fast: false
       matrix:
-        ros_distro: [humble, jazzy]
+        ros_distro: [humble, jazzy, rolling]
     runs-on: ubuntu-latest
     container:
       image: ros:${{ matrix.ros_distro }}-ros-base
     steps:
       - uses: actions/checkout@v4
+
+      - name: Cache apt packages
+        uses: actions/cache@v4
+        with:
+          path: /var/cache/apt/archives
+          key: apt-${{ matrix.ros_distro }}-${{ hashFiles('package.xml') }}
+          restore-keys: |
+            apt-${{ matrix.ros_distro }}-
 
       - name: Install dependencies
         run: |
@@ -27,11 +65,38 @@ jobs:
       - name: Build
         run: |
           . /opt/ros/${{ matrix.ros_distro }}/setup.sh
-          colcon build --packages-select ros2_diag_tui
+          colcon build --packages-select ros2_diag_tui \
+            --event-handlers console_direct+
 
       - name: Test
         run: |
           . /opt/ros/${{ matrix.ros_distro }}/setup.sh
           . install/setup.sh
-          colcon test --packages-select ros2_diag_tui
+          colcon test --packages-select ros2_diag_tui \
+            --event-handlers console_direct+
           colcon test-result --verbose
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-${{ matrix.ros_distro }}
+          path: |
+            build/ros2_diag_tui/test_results/
+            log/
+          retention-days: 14
+
+  release:
+    name: Release
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: build-and-test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
